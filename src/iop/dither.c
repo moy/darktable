@@ -38,6 +38,8 @@
 
 #include <gtk/gtk.h>
 #include <inttypes.h>
+#undef __SSE__
+#undef __SSE2__
 #if defined(__SSE__)
 #include <xmmintrin.h>
 #endif
@@ -45,7 +47,7 @@
 #define CLIP(x) ((x < 0) ? 0.0 : (x > 1.0) ? 1.0 : x)
 #define TEA_ROUNDS 8
 
-DT_MODULE_INTROSPECTION(1, dt_iop_dither_params_t)
+DT_MODULE_INTROSPECTION(2, dt_iop_dither_params_t)
 
 typedef void(_find_nearest_color)(float *val, float *err, const float f, const float rf);
 
@@ -63,6 +65,23 @@ typedef enum dt_iop_dither_type_t
   DITHER_FSAUTO
 } dt_iop_dither_type_t;
 
+typedef enum dt_iop_dither_channels_type_t {
+  DITHER_CHANNELS_NO,
+  DITHER_CHANNELS_NORMAL_PLUS_COLORS,
+  DITHER_CHANNELS_ONLY_COLORS,
+} dt_iop_dither_channels_type_t;
+
+typedef struct dt_iop_dither_params1_t
+{
+  dt_iop_dither_type_t dither_type;
+  int palette; // reserved for future extensions
+  struct
+  {
+    float radius;   // reserved for future extensions
+    float range[4]; // reserved for future extensions
+    float damping;
+  } random;
+} dt_iop_dither_params1_t;
 
 typedef struct dt_iop_dither_params_t
 {
@@ -74,11 +93,13 @@ typedef struct dt_iop_dither_params_t
     float range[4]; // reserved for future extensions
     float damping;
   } random;
+  dt_iop_dither_channels_type_t dither_channels;
 } dt_iop_dither_params_t;
 
 typedef struct dt_iop_dither_gui_data_t
 {
   GtkWidget *dither_type;
+  GtkWidget *dither_channels;
   GtkWidget *random;
   GtkWidget *radius;
   GtkWidget *range;
@@ -95,7 +116,22 @@ typedef struct dt_iop_dither_data_t
     float range[4];
     float damping;
   } random;
+  dt_iop_dither_channels_type_t dither_channels;
 } dt_iop_dither_data_t;
+
+int legacy_params(dt_iop_module_t *self, const void *const old_params, const int old_version, void *new_params,
+                  const int new_version)
+{
+  if(old_version == 1 && new_version == 2)
+  {
+    dt_iop_dither_params1_t *o = (dt_iop_dither_params1_t *)old_params;
+    dt_iop_dither_params_t *n = (dt_iop_dither_params_t *)new_params;
+    memcpy(n, o, sizeof(dt_iop_dither_params1_t));
+    n->dither_channels = DITHER_CHANNELS_NO;
+  }
+  return 1;
+}
+
 
 const char *name()
 {
@@ -209,6 +245,79 @@ static inline void _diffuse_error(float *val, const float *err, const float fact
   }
 }
 
+static inline void diffuse_error_other_channels(float *val, float *err, const float f, const float rf,
+                                                dt_iop_dither_channels_type_t dither_channels)
+{
+  if(dither_channels == DITHER_CHANNELS_NO) return;
+#define R_COEF 0.3f
+#define G_COEF 0.6f
+#define B_COEF 0.1f
+  float sum_err;
+  float old_r = val[0];
+  float old_g = val[1];
+  float old_b = val[2];
+  float oldr_r = err[0];
+  float oldr_g = err[1];
+  float oldr_b = err[2];
+  int r = 0, g = 0, b = 0;
+  sum_err = (err[0] * R_COEF + err[1] * G_COEF + err[2] * B_COEF) * f;
+  float oldsum = sum_err;
+  int erri = floorf(fabs(sum_err * 2.0f * 4.0f));
+  int sign = sum_err >= 0 ? 1 : -1;
+  erri = abs(erri);
+  switch(erri)
+  {
+    case 0:
+      break;
+    case 1:
+      b += 1;
+      break;
+    case 2:
+      r += 1;
+      break;
+    case 3:
+      r += 1;
+      b += 1;
+      break;
+    case 4:
+      g += 1;
+      break;
+    case 5:
+      g += 1;
+      b += 1;
+      break;
+    case 6:
+      g += 1;
+      r += 1;
+      b += 1;
+      break;
+  }
+  r *= sign;
+  g *= sign;
+  b *= sign;
+
+  val[0] += rf * r;
+  err[0] -= rf * r;
+
+  val[1] += rf * g;
+  err[1] -= rf * g;
+
+  val[2] += rf * b;
+  err[2] -= rf * b;
+
+  /* if (old_r != val[0] || */
+  /*     old_g != val[1] || */
+  /*     old_b != val[2]) { */
+  /*   sum_err = (err[0] * R_COEF + err[1] * G_COEF + err[2] * B_COEF) * f; */
+  /*   printf("old=%f %f %f   olderr=%f %f %f   oldsum=%f newsum=%f   new=%f %f %f    changes=%d %d %d\n", */
+  /*          old_r, old_g, old_b, oldr_r, oldr_g, oldr_b, oldsum, sum_err, val[0], val[1], val[2], r, g, b); */
+  /* } */
+  (void)(old_r + old_g + old_b + oldr_r + oldr_g + oldr_b + oldsum + sum_err + val[0] + val[1] + val[2] + r + g
+         + b);
+  if(dither_channels == DITHER_CHANNELS_ONLY_COLORS)
+    for(int c = 0; c < 4; c++) err[c] = 0.0f;
+}
+
 #if defined(__SSE__)
 static inline void _diffuse_error_sse(float *val, const __m128 err, const float factor)
 {
@@ -234,7 +343,6 @@ static void process_floyd_steinberg(struct dt_iop_module_t *self, dt_dev_pixelpi
                                     const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
 {
   dt_iop_dither_data_t *data = (dt_iop_dither_data_t *)piece->data;
-
   const int width = roi_in->width;
   const int height = roi_in->height;
   const int ch = piece->colors;
@@ -348,6 +456,7 @@ static void process_floyd_steinberg(struct dt_iop_module_t *self, dt_dev_pixelpi
 
     // first column
     nearest_color(out, err, f, rf);
+    diffuse_error_other_channels(out, err, f, rf, data->dither_channels);
     _diffuse_error(out + ch, err, 7.0f / 16.0f);
     _diffuse_error(out + ch * width, err, 5.0f / 16.0f);
     _diffuse_error(out + ch * (width + 1), err, 1.0f / 16.0f);
@@ -357,6 +466,7 @@ static void process_floyd_steinberg(struct dt_iop_module_t *self, dt_dev_pixelpi
     for(int i = 1; i < width - 1; i++)
     {
       nearest_color(out + ch * i, err, f, rf);
+      diffuse_error_other_channels(out + ch * i, err, f, rf, data->dither_channels);
       _diffuse_error(out + ch * (i + 1), err, 7.0f / 16.0f);
       _diffuse_error(out + ch * (i - 1) + ch * width, err, 3.0f / 16.0f);
       _diffuse_error(out + ch * i + ch * width, err, 5.0f / 16.0f);
@@ -365,6 +475,7 @@ static void process_floyd_steinberg(struct dt_iop_module_t *self, dt_dev_pixelpi
 
     // last column
     nearest_color(out + ch * (width - 1), err, f, rf);
+    diffuse_error_other_channels(out + ch * (width - 1), err, f, rf, data->dither_channels);
     _diffuse_error(out + ch * (width - 2) + ch * width, err, 3.0f / 16.0f);
     _diffuse_error(out + ch * (width - 1) + ch * width, err, 5.0f / 16.0f);
   }
@@ -376,6 +487,7 @@ static void process_floyd_steinberg(struct dt_iop_module_t *self, dt_dev_pixelpi
 
     // lower left pixel
     nearest_color(out, err, f, rf);
+    diffuse_error_other_channels(out, err, f, rf, data->dither_channels);
     _diffuse_error(out + ch, err, 7.0f / 16.0f);
 
     // main part of last row
@@ -514,6 +626,7 @@ static void process_floyd_steinberg_sse2(struct dt_iop_module_t *self, dt_dev_pi
 
     // first column
     err = nearest_color(out, f, rf);
+    diffuse_error_other_channels(out, err, f, rf, data->dither_channels);
     _diffuse_error_sse(out + ch, err, 7.0f / 16.0f);
     _diffuse_error_sse(out + ch * width, err, 5.0f / 16.0f);
     _diffuse_error_sse(out + ch * (width + 1), err, 1.0f / 16.0f);
@@ -668,6 +781,15 @@ static void method_callback(GtkWidget *widget, gpointer user_data)
   dt_dev_add_history_item(darktable.develop, self, TRUE);
 }
 
+static void dither_channels_changed(GtkWidget *widget, gpointer user_data)
+{
+  dt_iop_module_t *self = (dt_iop_module_t *)user_data;
+  if(self->dt->gui->reset) return;
+  dt_iop_dither_params_t *p = (dt_iop_dither_params_t *)self->params;
+  p->dither_channels = dt_bauhaus_combobox_get(widget);
+  dt_dev_add_history_item(darktable.develop, self, TRUE);
+}
+
 #if 0
 static void
 radius_callback (GtkWidget *slider, gpointer user_data)
@@ -711,6 +833,7 @@ void commit_params(struct dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pix
   dt_iop_dither_data_t *d = (dt_iop_dither_data_t *)piece->data;
 
   d->dither_type = p->dither_type;
+  d->dither_channels = p->dither_channels;
   memcpy(&(d->random.range), &(p->random.range), sizeof(p->random.range));
   d->random.radius = p->random.radius;
   d->random.damping = p->random.damping;
@@ -735,6 +858,7 @@ void gui_update(struct dt_iop_module_t *self)
   dt_iop_dither_gui_data_t *g = (dt_iop_dither_gui_data_t *)self->gui_data;
   dt_iop_dither_params_t *p = (dt_iop_dither_params_t *)module->params;
   dt_bauhaus_combobox_set(g->dither_type, p->dither_type);
+  dt_bauhaus_combobox_set(g->dither_channels, p->dither_channels);
 #if 0
   dt_bauhaus_slider_set(g->radius, p->random.radius);
 
@@ -791,6 +915,13 @@ void gui_init(struct dt_iop_module_t *self)
   dt_bauhaus_combobox_add(g->dither_type, _("floyd-steinberg auto"));
   dt_bauhaus_widget_set_label(g->dither_type, NULL, _("method"));
 
+  g->dither_channels = dt_bauhaus_combobox_new(self);
+  dt_bauhaus_combobox_add(g->dither_channels, _("disabled"));
+  dt_bauhaus_combobox_add(g->dither_channels, _("inter-colors + inter-pixels"));
+  dt_bauhaus_combobox_add(g->dither_channels, _("inter-colors only"));
+  dt_bauhaus_widget_set_label(g->dither_channels, NULL, _("inter-color dithering"));
+  gtk_widget_set_tooltip_text(g->dither_channels, _("use colors channels to simulate more shades"));
+
 #if 0
   g->radius = dt_bauhaus_slider_new_with_range(self, 0.0, 200.0, 0.1, p->random.radius, 2);
   gtk_widget_set_tooltip_text(g->radius, _("radius for blurring step"));
@@ -826,6 +957,7 @@ void gui_init(struct dt_iop_module_t *self)
 
   gtk_box_pack_start(GTK_BOX(self->widget), g->dither_type, TRUE, TRUE, 0);
   gtk_box_pack_start(GTK_BOX(self->widget), g->random, TRUE, TRUE, 0);
+  gtk_box_pack_start(GTK_BOX(self->widget), g->dither_channels, TRUE, TRUE, 0);
 
   g_signal_connect(G_OBJECT(g->dither_type), "value-changed", G_CALLBACK(method_callback), self);
 #if 0
@@ -835,6 +967,7 @@ void gui_init(struct dt_iop_module_t *self)
                     G_CALLBACK (range_callback), self);
 #endif
   g_signal_connect(G_OBJECT(g->damping), "value-changed", G_CALLBACK(damping_callback), self);
+  g_signal_connect(G_OBJECT(g->dither_channels), "value-changed", G_CALLBACK(dither_channels_changed), self);
 }
 
 void gui_cleanup(struct dt_iop_module_t *self)
